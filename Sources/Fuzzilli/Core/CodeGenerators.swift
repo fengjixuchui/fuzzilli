@@ -92,7 +92,7 @@ public func FunctionDefinitionGenerator(_ b: ProgramBuilder) {
     // For functions, we always generate one random instruction and one return instruction as function body.
     // This ensures that generating one random instruction does not accidentially generate multiple instructions
     // (which increases the likelyhood of runtime exceptions), but also generates somewhat useful functions.
-    b.defineFunction(numParameters: Int.random(in: 2...5), isJSStrictMode: probability(0.2)) { _ in
+    b.defineFunction(numParameters: Int.random(in: 2...5), isJSStrictMode: probability(0.2), hasRestParam: probability(0.2)) { _ in
         b.generate()
         b.doReturn(value: b.randVar())
     }
@@ -431,7 +431,7 @@ public func PropertyAccessorGenerator(_ b: ProgramBuilder) {
 public func ProxyGenerator(_ b: ProgramBuilder) {
     let target = b.randVar()
     
-    var candidates = Set(["getPrototypeOf", "setPrototypeOf", "isExtensible", "preventExtension", "getOwnPropertyDescriptor", "defineProperty", "has", "get", "set", "deleteProperty", "ownKeys", "apply", "call", "construct"])
+    var candidates = Set(["getPrototypeOf", "setPrototypeOf", "isExtensible", "preventExtensions", "getOwnPropertyDescriptor", "defineProperty", "has", "get", "set", "deleteProperty", "ownKeys", "apply", "call", "construct"])
     
     var handlerProperties = [String: Variable]()
     for _ in 0..<Int.random(in: 0..<candidates.count) {
@@ -469,9 +469,9 @@ public func ElementKindChangeGenerator(_ b: ProgramBuilder) {
 public func WithStatementGenerator(_ b: ProgramBuilder) {
     let obj = b.randVar(ofType: .MaybeObject)
     b.with(obj) {
-        withProbability(0.5, do: { () -> () in
+        withProbability(0.5, do: { () -> Void in
             b.loadFromScope(id: b.genPropertyName())
-        }, else: { () -> () in
+        }, else: { () -> Void in
             let value = b.randVar()
             b.storeToScope(value, as: b.genPropertyName())
         })

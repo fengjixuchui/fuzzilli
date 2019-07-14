@@ -16,16 +16,22 @@ import Foundation
 
 public class Fuzzer {
     /// Id of this fuzzer.
-    public let id: Int
+    public let id: UUID
     
     /// Has this fuzzer been initialized?
     public private(set) var isInitialized = false
-    
-    /// The DispatchQueue that this fuzzer operates on.
-    public let queue: DispatchQueue
 
     /// The configuration used by this fuzzer.
     public let config: Configuration
+    
+    /// The OperationQueue that this fuzzer operates on.
+    public let queue: OperationQueue
+    
+    /// The list of events that can be dispatched on this fuzzer instance.
+    public let events: Events
+    
+    /// Timer API for this fuzzer.
+    public let timers: Timers
     
     /// The script runner used to execute generated scripts.
     public let runner: ScriptRunner
@@ -41,21 +47,15 @@ public class Fuzzer {
     
     /// The model of the target environment.
     public let environment: Environment
-
+    
     /// The lifter to translate FuzzIL programs to the target language.
     public let lifter: Lifter
     
     /// The corpus of "interesting" programs found so far.
     public let corpus: Corpus
     
-    /// The list of events that can be dispatched on this fuzzer instance.
-    public let events = Events()
-    
     // The minimizer to shrink programs that cause crashes or trigger new interesting behaviour.
     public let minimizer: Minimizer
-    
-    /// Timer API for this fuzzer.
-    public let timers: Timers
     
     /// The modules active on this fuzzer.
     var modules = [String: Module]()
@@ -67,13 +67,16 @@ public class Fuzzer {
     private var maxIterations = -1
     private var iterations = 0
 
-    /// Construct a new fuzzer instance with the provided components.
-    public init(id: Int, queue: DispatchQueue, configuration: Configuration, scriptRunner: ScriptRunner, coreFuzzer: FuzzerCore, codeGenerators: WeightedList<CodeGenerator>, evaluator: ProgramEvaluator, environment: Environment, lifter: Lifter, corpus: Corpus, minimizer: Minimizer) {
-        self.id = id
-        self.queue = queue
+    /// Constructs a new fuzzer instance with the provided components.
+    public init(configuration: Configuration, scriptRunner: ScriptRunner, coreFuzzer: FuzzerCore, codeGenerators: WeightedList<CodeGenerator>, evaluator: ProgramEvaluator, environment: Environment, lifter: Lifter, corpus: Corpus, minimizer: Minimizer, queue: OperationQueue? = nil) {
+        self.id = UUID()
+        self.queue = queue ?? OperationQueue()
+        self.queue.maxConcurrentOperationCount = 1
+        self.queue.name = "Fuzzer \(id)"
         self.config = configuration
-        self.timers = Timers(queue: queue)
-        self.logger = Logger(logEvent: events.Log, instance: id, label: "Fuzzer", minLevel: config.logLevel)
+        self.events = Events(self.queue)
+        self.timers = Timers(queue: self.queue)
+        self.logger = Logger(creator: id, logEvent: events.Log, label: "Fuzzer", minLevel: config.logLevel)
         self.core = coreFuzzer
         self.codeGenerators = codeGenerators
         self.evaluator = evaluator
@@ -84,44 +87,56 @@ public class Fuzzer {
         self.minimizer = minimizer
     }
     
-    /// Add a module to this fuzzer. Can only be called before the fuzzer is initialized.
+    /// Adds a module to this fuzzer. Can only be called before the fuzzer is initialized.
     public func addModule(_ module: Module) {
         precondition(!isInitialized)
         precondition(modules[module.name] == nil)
+        assert(OperationQueue.current == queue)
         modules[module.name] = module
     }
-    
-    /// Shut down this fuzzer.
-    public func shutdown() {
-        logger.info("Fuzzer \(self.id) shutting down")
-        dispatchEvent(self.events.Shutdown)
-    }
 
-    /// Start the fuzzer and run for the specified number of iterations.
+    /// Starts the fuzzer and runs for the specified number of iterations.
     ///
-    /// This will also initialize the fuzzer if necessary and run startup tests.
+    /// This must be called after initializing the fuzzer.
     /// Use -1 for maxIterations to run indefinitely.
     public func start(runFor maxIterations: Int) {
-        self.maxIterations = maxIterations
+        precondition(isInitialized)
+        assert(OperationQueue.current == queue)
         
-        if !self.isInitialized {
-            self.initialize()
-        }
+        self.maxIterations = maxIterations
         
         self.runStartupTests()
         
-        queue.async {
-            self.fuzzOne()
+        logger.info("Let's go!")
+        
+        // Start fuzzing
+        queue.addOperation {
+           self.fuzzOne()
         }
     }
     
-    /// Initialize this fuzzer.
+    /// Stops this fuzzer.
+    public func stop() {
+        assert(OperationQueue.current == queue)
+        
+        logger.info("Shutting down")
+        events.Shutdown.dispatch()
+        
+        // Stop any pending or future tasks now
+        queue.cancelAllOperations()
+        queue.isSuspended = true
+        
+        events.ShutdownComplete.dispatch()
+    }
+    
+    /// Initializes this fuzzer.
     ///
     /// This will initialize all components and modules, causing event listeners to be registerd,
     /// timers to be scheduled, communication channels to be established, etc. After initialization,
     /// task may already be scheduled on this fuzzer's dispatch queue.
     public func initialize() {
         precondition(!isInitialized)
+        assert(OperationQueue.current == queue)
         
         // Initialize the script runner first so we are able to execute programs.
         runner.initialize(with: self)
@@ -153,22 +168,43 @@ public class Fuzzer {
         
         // Install a watchdog to monitor utilization of master instances.
         if config.isMaster {
-            var lastCheck = currentMillis()
+            var lastCheck = Date()
+            var lastReset = 0
             timers.scheduleTask(every: 1 * Minutes) {
-                let interval = Double(currentMillis() - lastCheck) / 1000 / 60
-                lastCheck = currentMillis()
-                if interval > 2.0 {
-                    self.logger.warning("Fuzzing master appears overloaded (by ~\(Int(interval * 100))%). Maybe reduce the number of workers if this message keeps appearing.")
+                // Monitor responsiveness
+                let now = Date()
+                let interval = now.timeIntervalSince(lastCheck)
+                lastCheck = now
+                // Currently, minimization can take a very long time (up to a few minutes on slow CPUs for
+                // big samples). As such, the fuzzer would quickly be regarded as unresponsive by this metric.
+                // Ideally, it would be possible to split minimization into multiple smaller tasks or otherwise
+                // reduce its impact on the responsiveness of the fuzzer. But for now we just use a very large
+                // tolerance interval here...
+                if interval > 180 {
+                    self.logger.warning("Fuzzing master appears unresponsive (watchdog only triggered after \(Int(interval))s instead of 60s). This is usually fine but will slow down synchronization a bit")
+                }
+                
+                // Monitor utilization. If the size of the operation queue hasn't fallen
+                // below 5 for 15 minutes in a row, then we might be overloaded.
+                let currentQueueSize = self.queue.operationCount
+                if currentQueueSize < 5 {
+                    lastReset = 0
+                } else {
+                    lastReset += 1
+                    if lastReset >= 15 {
+                        self.logger.warning("Fuzzing master appears overloaded (pending tasks: \(currentQueueSize)). Maybe reduce the number of workers")
+                        lastReset = 0
+                    }
                 }
             }
         }
         
-        dispatchEvent(events.Initialized)
+        events.Initialized.dispatch()
         logger.info("Initialized")
         isInitialized = true
     }
     
-    /// Import a potentially interesting program into this fuzzer.
+    /// Imports a potentially interesting program into this fuzzer.
     ///
     /// When importing, the program will be treated like one that was generated by this fuzzer. As such it will
     /// be executed and evaluated to determine whether it results in previously unseen, interesting behaviour.
@@ -178,14 +214,14 @@ public class Fuzzer {
         core.importProgram(program, withDropout: applyDropout)
     }
     
-    /// Import a crashing program into this fuzzer.
+    /// Imports a crashing program into this fuzzer.
     ///
     /// Similar to importProgram, but will make sure to generate a CrashFound event even if the crash does not reproduce.
     public func importCrash(_ program: Program) {
         core.importProgram(program, withDropout: false, isCrash: true)
     }
     
-    /// Import a corpus of programs into this fuzzer.
+    /// Imports multiple programs into this fuzzer.
     ///
     /// This will import each program in the given array into this fuzzer while potentially discarding
     /// some percentage of the programs if dropout is enabled.
@@ -195,7 +231,24 @@ public class Fuzzer {
         }
     }
     
-    /// Execute a program.
+    /// Exports the internal state of this fuzzer.
+    ///
+    /// The state returned by this function can be passed to the importState method to restore
+    /// the state. This can be used to synchronize different fuzzer instances and makes it
+    /// possible to resume a previous fuzzing run at a later time.
+    public func exportState() -> State {
+        return State(corpus: corpus.exportState(), evaluatorState: evaluator.exportState())
+    }
+    
+    /// Import a previously exported fuzzing state.
+    ///
+    /// If importing fails, this method will throw a Fuzzilli.RuntimeError.
+    public func importState(_ state: State) throws {
+        try corpus.importState(state.corpus)
+        try evaluator.importState(state.evaluatorState)
+    }
+    
+    /// Executes a program.
     ///
     /// This will first lift the given FuzzIL program to the target language, then use the configured script runner to execute it.
     ///
@@ -205,8 +258,9 @@ public class Fuzzer {
     /// - Returns: An Execution structure representing the execution outcome.
     public func execute(_ program: Program, withTimeout timeout: UInt32? = nil) -> Execution {
         assert(runner.isInitialized)
+        assert(OperationQueue.current == queue)
         
-        dispatchEvent(events.PreExecute, data: program)
+        events.PreExecute.dispatch(with: program)
         
         let script: String
         if config.speedTestMode {
@@ -216,25 +270,25 @@ public class Fuzzer {
         }
         let execution = runner.run(script, withTimeout: timeout ?? config.timeout)
         
-        dispatchEvent(events.PostExecute, data: execution)
+        events.PostExecute.dispatch(with: execution)
         
         return execution
     }
     
-    /// Construct a new ProgramBuilder using this fuzzing context.
+    /// Constructs a new ProgramBuilder using this fuzzing context.
     public func makeBuilder() -> ProgramBuilder {
         return ProgramBuilder(for: self)
     }
     
-    /// Construct a logger that generates log messages on this fuzzer.
+    /// Constructs a logger that generates log messages on this fuzzer.
     ///
     /// - Parameter label: The label for the logger.
     /// - Returns: The new Logger instance.
     public func makeLogger(withLabel label: String) -> Logger {
-        return Logger(logEvent: events.Log, instance: id, label: label, minLevel: config.logLevel)
+        return Logger(creator: id, logEvent: events.Log, label: label, minLevel: config.logLevel)
     }
     
-    /// Perform one round of fuzzing.
+    /// Performs one round of fuzzing.
     private func fuzzOne() {
         guard maxIterations == -1 || iterations < maxIterations else {
             return
@@ -244,16 +298,18 @@ public class Fuzzer {
         core.fuzzOne()
         
         // Fuzz another one.
-        queue.async {
-            self.fuzzOne()
-        }
+        // We only want do actual fuzzing if there is nothing else to do. For that
+        // reason we enqueue the corresponding operations with low priority.
+        let op = BlockOperation(block: self.fuzzOne)
+        op.queuePriority = .veryLow
+        queue.addOperation(op)
     }
 
-    /// Construct a non-trivial program. Useful to measure program execution speed.
+    /// Constructs a non-trivial program. Useful to measure program execution speed.
     private func makeComplexProgram() -> Program {
         let b = makeBuilder()
         
-        let f = b.defineFunction(numParameters: 2, isJSStrictMode: false) { params in
+        let f = b.defineFunction(numParameters: 2, isJSStrictMode: false, hasRestParam: false) { params in
             let x = b.loadProperty("x", of: params[0])
             let y = b.loadProperty("y", of: params[0])
             let s = b.binary(x, y, with: .Add)
@@ -272,7 +328,7 @@ public class Fuzzer {
         return b.finish()
     }
     
-    /// Run a number of startup tests to check whether everything is configured correctly.
+    /// Runs a number of startup tests to check whether everything is configured correctly.
     private func runStartupTests() {
         guard !config.speedTestMode else {
             logger.info("Skipping startup tests due to speed test mode")
@@ -338,5 +394,14 @@ public class Fuzzer {
         }
         
         logger.info("Startup tests finished successfully")
+    }
+    
+    /// The internal state of a fuzzer.
+    ///
+    /// Can be exported and later imported again or used to synchronize workers.
+    public struct State: Codable {
+        // Really only the corpus and the evaluator have permanent state.
+        public let corpus: [Program]
+        public let evaluatorState: Data
     }
 }

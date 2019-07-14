@@ -12,13 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+import Foundation
 import libcoverage
 
 class CovEdgeSet: ProgramAspects {
-    let count: Int
+    let count: UInt64
     let edges: UnsafeMutablePointer<UInt32>?
 
-    init(edges: UnsafeMutablePointer<UInt32>?, count: Int) {
+    init(edges: UnsafeMutablePointer<UInt32>?, count: UInt64) {
         self.count = count
         self.edges = edges
         super.init(outcome: .succeeded)
@@ -58,12 +59,12 @@ public class ProgramCoverageEvaluator: ComponentBase, ProgramEvaluator {
     
     override func initialize() {
         // Must clear the shared memory bitmap before every execution
-        addEventListener(for: fuzzer.events.PreExecute) { execution in
+        fuzzer.events.PreExecute.observe { execution in
             libcoverage.cov_clear_bitmap(&self.context)
         }
         
         // Unlink the shared memory regions on shutdown
-        addEventListener(for: fuzzer.events.Shutdown) {
+        fuzzer.events.Shutdown.observe {
             libcoverage.cov_shutdown(&self.context)
         }
         
@@ -117,5 +118,44 @@ public class ProgramCoverageEvaluator: ComponentBase, ProgramEvaluator {
         } else {
             return true
         }
+    }
+    
+    public func exportState() -> Data {
+        var state = Data()
+        state.append(Data(bytes: &context.num_edges, count: 8))
+        state.append(Data(bytes: &context.bitmap_size, count: 8))
+        state.append(Data(bytes: &context.found_edges, count: 8))
+        state.append(context.virgin_bits, count: Int(context.bitmap_size))
+        state.append(context.crash_bits, count: Int(context.bitmap_size))
+        return state
+    }
+    
+    public func importState(_ state: Data) throws {
+        assert(isInitialized)
+        
+        guard state.count == 24 + context.bitmap_size * 2 else {
+            throw RuntimeError("Cannot import coverage state as it has an unexpected size. Ensure all instances use the same build of the target")
+        }
+        
+        let numEdges = state.withUnsafeBytes { $0.load(fromByteOffset: 0, as: UInt64.self) }
+        let bitmapSize = state.withUnsafeBytes { $0.load(fromByteOffset: 8, as: UInt64.self) }
+        let foundEdges = state.withUnsafeBytes { $0.load(fromByteOffset: 16, as: UInt64.self) }
+        
+        guard bitmapSize == context.bitmap_size && numEdges == context.num_edges else {
+            throw RuntimeError("Cannot import coverage state due to different bitmap sizes. Ensure all instances use the same build of the target")
+        }
+        
+        if foundEdges < context.found_edges {
+            return logger.info("Not importing coverage state as it has less found edges than ours")
+        }
+        
+        context.found_edges = foundEdges
+        
+        var start = state.startIndex + 24
+        state.copyBytes(to: context.virgin_bits, from: start..<start + Int(bitmapSize))
+        start += Int(bitmapSize)
+        state.copyBytes(to: context.crash_bits, from: start..<start + Int(bitmapSize))
+        
+        logger.info("Imported existing coverage state with \(foundEdges) edges already discovered")
     }
 }

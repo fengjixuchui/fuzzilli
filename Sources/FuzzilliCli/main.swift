@@ -26,17 +26,27 @@ Usage:
 \(args.programName) [options] --profile=<profile> /path/to/jsshell
 
 Options:
-    --profile=name              : Select one of several preconfigured profiles. Available profiles: \(profiles.keys).
-    --numIterations=n           : Run for the specified number of iterations only.
-    --timeout                   : Timeout in ms after which to interrupt execution of programs (default: 250).
-    --minCorpusSize=n           : Keep this many samples in the corpus at all times (default: 1024).
-    --minMutationsPerSample=n   : Discard samples from the corpus only after they have been mutated at least this many times (default: 16).
+    --profile=name              : Select one of several preconfigured profiles.
+                                  Available profiles: \(profiles.keys).
+    --logLevel=level            : The log level to use. Valid values: "verbose", info", "warning", "error", "fatal"
+                                  (default: "info").
+    --numIterations=n           : Run for the specified number of iterations (default: unlimited).
+    --timeout=n                 : Timeout in ms after which to interrupt execution of programs (default: 250).
+    --minMutationsPerSample=n   : Discard samples from the corpus after they have been mutated at least this
+                                  many times (default: 16).
+    --minCorpusSize=n           : Keep at least this many samples in the corpus regardless of the number of times
+                                  they have been mutated (default: 1024).
+    --maxCorpusSize=n           : Only allow the corpus to grow to this many samples. Otherwise the oldest samples
+                                  will be discarded (default: unlimited).
     --consecutiveMutations=n    : Perform this many consecutive mutations on each sample (default: 5).
-    --minimizationLimit=n       : When minimizing corpus samples, keep at least this many instructions in the program. See Minimizer.swift for an overview of this feature (default: 0).
+    --minimizationLimit=n       : When minimizing corpus samples, keep at least this many instructions in the
+                                  program. See Minimizer.swift for an overview of this feature (default: 0).
     --storagePath=path          : Path at which to store runtime files (crashes, corpus, etc.) to.
-    --exportCorpus=true/false   : Whether to export the entire corpus to disk in regular intervals (only if storage is enabled, default: false).
-    --importCorpus=path         : Import an existing corpus before starting the fuzzer.
-    --networkMaster=host:port   : Run as master and accept connections from workers over the network.
+    --exportState               : If enabled, the internal state of the fuzzer will be writen to disk every
+                                  6 hours. Requires --storagePath.
+    --importState=path          : Import a previously exported fuzzer state and resuming fuzzing from it.
+    --networkMaster=host:port   : Run as master and accept connections from workers over the network. Note: it is
+                                  *highly* recommended to run network fuzzers in an isolated network!
     --networkWorker=host:port   : Run as worker and connect to the specified master instance.
 """)
     exit(0)
@@ -53,15 +63,33 @@ if profile == nil {
     exit(-1)
 }
 
+let logLevelName = args["--logLevel"] ?? "info"
 let numIterations = args.int(for: "--numIterations") ?? -1
 let timeout = args.int(for: "--timeout") ?? 250
-let minCorpusSize = args.int(for: "--minCorpusSize") ?? 1024
 let minMutationsPerSample = args.int(for: "--minMutationsPerSample") ?? 16
+let minCorpusSize = args.int(for: "--minCorpusSize") ?? 1024
+let maxCorpusSize = args.int(for: "--maxCorpusSize") ?? Int.max
 let consecutiveMutations = args.int(for: "--consecutiveMutations") ?? 5
 let minimizationLimit = args.uint(for: "--minimizationLimit") ?? 0
 let storagePath = args["--storagePath"]
-let exportCorpus = args.bool(for: "--exportCorpus") ?? false
-let corpusPath = args["--importCorpus"]
+let exportState = args.has("--exportState")
+let stateImportFile = args["--importState"]
+
+let logLevelByName: [String: LogLevel] = ["verbose": .verbose, "info": .info, "warning": .warning, "error": .error, "fatal": .fatal]
+guard let logLevel = logLevelByName[logLevelName] else {
+    print("Invalid log level \(logLevelName)")
+    exit(-1)
+}
+
+if exportState && storagePath == nil {
+    print("--exportState requires --storagePath")
+    exit(-1)
+}
+
+if maxCorpusSize < minCorpusSize {
+    print("--maxCorpusSize must be larger than --minCorpusSize")
+    exit(-1)
+}
 
 var networkMasterParams: (String, UInt16)? = nil
 if let val = args["--networkMaster"] {
@@ -69,6 +97,7 @@ if let val = args["--networkMaster"] {
         networkMasterParams = params
     } else {
         print("Argument --networkMaster must be of the form \"host:port\"")
+        exit(-1)
     }
 }
 
@@ -78,6 +107,7 @@ if let val = args["--networkWorker"] {
         networkWorkerParams = params
     } else {
         print("Argument --networkWorker must be of the form \"host:port\"")
+        exit(-1)
     }
 }
 
@@ -92,11 +122,12 @@ if args.unusedOptionals.count > 0 {
 //
 
 // The configuration of this fuzzer.
-let configuration = Configuration(timeout: UInt32(timeout),
-                                  crashTests: profile.crashTests,
-                                  isMaster: networkMasterParams != nil,
-                                  isWorker: networkWorkerParams != nil,
-                                  minimizationLimit: minimizationLimit)
+let config = Configuration(timeout: UInt32(timeout),
+                           logLevel: logLevel,
+                           crashTests: profile.crashTests,
+                           isMaster: networkMasterParams != nil,
+                           isWorker: networkWorkerParams != nil,
+                           minimizationLimit: minimizationLimit)
 
 // A script runner to execute JavaScript code in an instrumented JS engine.
 let runner = REPRL(executable: jsShellPath, processArguments: profile.processArguments, processEnvironment: profile.processEnv)
@@ -129,15 +160,13 @@ let environment = JavaScriptEnvironment(builtins: profile.builtins, propertyName
 let lifter = JavaScriptLifter(prefix: profile.codePrefix, suffix: profile.codeSuffix, inliningPolicy: InlineOnlyLiterals())
 
 // Corpus managing interesting programs that have been found during fuzzing.
-let corpus = Corpus(minSize: minCorpusSize, minMutationsPerSample: minMutationsPerSample)
+let corpus = Corpus(minSize: minCorpusSize, maxSize: maxCorpusSize, minMutationsPerSample: minMutationsPerSample)
 
 // Minimizer to minimize crashes and interesting programs.
 let minimizer = Minimizer()
 
 // Construct the fuzzer instance.
-let fuzzer = Fuzzer(id: 0,
-                    queue: DispatchQueue.main,          // Run on the main queue
-                    configuration: configuration,
+let fuzzer = Fuzzer(configuration: config,
                     scriptRunner: runner,
                     coreFuzzer: core,
                     codeGenerators: codeGenerators,
@@ -147,67 +176,70 @@ let fuzzer = Fuzzer(id: 0,
                     corpus: corpus,
                     minimizer: minimizer)
 
-let logger = fuzzer.makeLogger(withLabel: "Cli")
-
-// Add optional modules.
-
-// Always want some statistics.
-fuzzer.addModule(Statistics())
-
-// Store samples to disk if requested.
-if let path = storagePath {
-    fuzzer.addModule(Storage(for: fuzzer, storageDir: path, exportCorpus: exportCorpus))
-}
-
-// Synchronize over the network if requested.
-if let (listenHost, listenPort) = networkMasterParams {
-    fuzzer.addModule(NetworkMaster(for: fuzzer, address: listenHost, port: listenPort))
-}
-if let (masterHost, masterPort) = networkWorkerParams {
-    fuzzer.addModule(NetworkWorker(for: fuzzer, hostname: masterHost, port: masterPort))
-}
-
-// Create a "UI".
+// Create a "UI". We do this now, before fuzzer initialization, so
+// we are able to print log messages generated during initialization.
 let ui = TerminalUI(for: fuzzer)
 
-// Check for potential misconfiguration.
-if !configuration.isWorker && storagePath == nil {
-    logger.warning("No filesystem storage configured, found crashes will be discarded!")
-}
+// Remaining fuzzer initialization must happen on the fuzzer's task queue.
+fuzzer.queue.addOperation {
+    let logger = fuzzer.makeLogger(withLabel: "Cli")
 
-// Initialize the fuzzer.
-fuzzer.initialize()
+    // Always want some statistics.
+    fuzzer.addModule(Statistics())
 
-// Import an existing corpus if requested.
-if let path = corpusPath {
-    do {
-        let decoder = JSONDecoder()
-        let data = try Data(contentsOf: URL(fileURLWithPath: path))
-        let corpus = try decoder.decode([Program].self, from: data)
-        fuzzer.importCorpus(corpus)
-        print("Imported \(corpus.count) samples")
-    } catch {
-        print("Failed to import corpus")
-        exit(-1)
+    // Store samples to disk if requested.
+    if let path = storagePath {
+        let stateExportInterval = exportState ? 6 * Hours : nil
+        fuzzer.addModule(Storage(for: fuzzer, storageDir: path, stateExportInterval: stateExportInterval))
     }
-}
 
-// And start fuzzing.
-fuzzer.start(runFor: numIterations)
+    // Synchronize over the network if requested.
+    if let (listenHost, listenPort) = networkMasterParams {
+        fuzzer.addModule(NetworkMaster(for: fuzzer, address: listenHost, port: listenPort))
+    }
+    if let (masterHost, masterPort) = networkWorkerParams {
+        fuzzer.addModule(NetworkWorker(for: fuzzer, hostname: masterHost, port: masterPort))
+    }
 
-// Seems like we need this so the dispatch sources below work correctly?
-signal(SIGINT, SIG_IGN)
+    // Check for potential misconfiguration.
+    if !config.isWorker && storagePath == nil {
+        logger.warning("No filesystem storage configured, found crashes will be discarded!")
+    }
 
-// Install signal handlers on the main thread.
-var signalSources: [DispatchSourceSignal] = []
-signalSources.append(DispatchSource.makeSignalSource(signal: SIGINT, queue: DispatchQueue.main))
-signalSources.append(DispatchSource.makeSignalSource(signal: SIGTERM, queue: DispatchQueue.main))
-for source in signalSources {
-    source.setEventHandler {
-        fuzzer.shutdown()
+    // Initialize the fuzzer.
+    fuzzer.initialize()
+
+    // Import a previously exported state if requested.
+    if let path = stateImportFile {
+        do {
+            let decoder = JSONDecoder()
+            let data = try Data(contentsOf: URL(fileURLWithPath: path))
+            let state = try decoder.decode(Fuzzer.State.self, from: data)
+            try fuzzer.importState(state)
+            logger.info("Successfully imported previous state. Corpus now contains \(fuzzer.corpus.size) elements")
+        } catch {
+            logger.fatal("Failed to import state: \(error.localizedDescription)")
+        }
+    }
+
+    // And start fuzzing.
+    fuzzer.start(runFor: numIterations)
+    
+    // Exit this process when the fuzzer stops.
+    fuzzer.events.ShutdownComplete.observe {
         exit(0)
     }
-    source.resume()
+}
+
+// Install signal handlers to terminate the fuzzer gracefully.
+var signalSources: [OperationSource] = []
+for sig in [SIGINT, SIGTERM] {
+    // Seems like we need this so the dispatch sources work correctly?
+    signal(sig, SIG_IGN)
+    
+    signalSources.append(OperationSource.forReceivingSignal(sig, on: fuzzer.queue) {
+        fuzzer.stop()
+    })
 }
 
 // Start dispatching tasks on the main queue.

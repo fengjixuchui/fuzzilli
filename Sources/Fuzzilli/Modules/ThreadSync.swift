@@ -22,9 +22,6 @@ public class LocalWorker: Module {
     /// The master instance to synchronize with.
     private let master: Fuzzer
     
-    /// Number of programs already imported from the master's corpus.
-    private var numImportedPrograms = 0
-    
     /// UUID of this instance.
     let id: UUID
     
@@ -32,49 +29,39 @@ public class LocalWorker: Module {
         self.master = master
         self.id = UUID()
         
-        let logger = worker.makeLogger(withLabel: "Worker")
-        
-        // "Identify" with the master.
-        master.queue.async {
-            dispatchEvent(master.events.WorkerConnected, data: self.id)
+        master.queue.addOperation {
+            // "Identify" with the master.
+            master.events.WorkerConnected.dispatch(with: self.id)
+            
+            // Corpus synchronization
+            master.events.InterestingProgramFound.observe { ev in
+                let program = ev.program.copy()
+                worker.queue.addOperation {
+                    worker.importProgram(program)
+                }
+            }
         }
         
         // Access to classes appears to be thread-safe...
         // TODO the programs should potentially be deep-copied, otherwise there will
         // be Operation instances used by multiple threads.
-        addEventListener(for: worker.events.CrashFound) { ev in
+        worker.events.CrashFound.observe { ev in
             let program = ev.program.copy()
-            master.queue.async {
+            master.queue.addOperation {
                 master.importCrash(program)
             }
         }
         
-        addEventListener(for: worker.events.InterestingProgramFound) { ev in
+        worker.events.InterestingProgramFound.observe { ev in
             let program = ev.program.copy()
-            master.queue.async {
+            master.queue.addOperation {
                 master.importProgram(program)
             }
         }
         
-        addEventListener(for: worker.events.Log) { ev in
-            master.queue.async {
-                dispatchEvent(master.events.Log, data: ev)
-            }
-        }
-        
-        // Regularly pull new programs from the master.
-        worker.timers.scheduleTask(every: 15 * Minutes) {
-            let skip = self.numImportedPrograms
-            master.queue.async {
-                var corpus = [Program]()
-                for program in master.corpus.export().dropFirst(skip) {
-                    corpus.append(program.copy())
-                }
-                worker.queue.async {
-                    worker.importCorpus(corpus, withDropout: true)
-                    logger.info("Imported \(corpus.count) programs from master")
-                    self.numImportedPrograms += corpus.count
-                }
+        worker.events.Log.observe { ev in
+            master.queue.addOperation {
+                master.events.Log.dispatch(with: ev)
             }
         }
         
@@ -82,7 +69,7 @@ public class LocalWorker: Module {
         if let stats = Statistics.instance(for: worker) {
             worker.timers.scheduleTask(every: 60 * Seconds) {
                 let data = stats.compute()
-                master.queue.async {
+                master.queue.addOperation {
                     Statistics.instance(for: master)?.importData(data, from: self.id)
                 }
             }

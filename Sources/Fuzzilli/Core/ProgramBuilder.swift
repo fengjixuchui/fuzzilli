@@ -183,7 +183,7 @@ public class ProgramBuilder {
     }
     
     /// Executes the given block after preparing for adoption from the provided program.
-    public func adopting(from program: Program, _ block: () -> ()) {
+    public func adopting(from program: Program, _ block: () -> Void) {
         beginAdoption(from: program)
         block()
         endAdoption()
@@ -407,8 +407,8 @@ public class ProgramBuilder {
     }
     
     @discardableResult
-    public func defineFunction(numParameters: Int, isJSStrictMode: Bool = false, _ body: ([Variable]) -> ()) -> Variable {
-        let instruction = perform(BeginFunctionDefinition(numParameters: numParameters, isJSStrictMode: isJSStrictMode))
+    public func defineFunction(numParameters: Int, isJSStrictMode: Bool = false, hasRestParam: Bool = false, _ body: ([Variable]) -> ()) -> Variable {
+        let instruction = perform(BeginFunctionDefinition(numParameters: numParameters, isJSStrictMode: isJSStrictMode, hasRestParam: hasRestParam))
         body(Array(instruction.innerOutputs))
         perform(EndFunctionDefinition())
         return instruction.output
@@ -481,12 +481,12 @@ public class ProgramBuilder {
         perform(StoreToScope(id: id), withInputs: [value])
     }
     
-    public func beginIf(_ conditional: Variable, _ body: () -> ()) {
+    public func beginIf(_ conditional: Variable, _ body: () -> Void) {
         perform(BeginIf(), withInputs: [conditional])
         body()
     }
     
-    public func beginElse(_ body: () -> ()) {
+    public func beginElse(_ body: () -> Void) {
         perform(BeginElse())
         body()
     }
@@ -495,13 +495,13 @@ public class ProgramBuilder {
         perform(EndIf())
     }
     
-    public func whileLoop(_ lhs: Variable, _ comparator: Comparator, _ rhs: Variable, _ body: () -> ()) {
+    public func whileLoop(_ lhs: Variable, _ comparator: Comparator, _ rhs: Variable, _ body: () -> Void) {
         perform(BeginWhile(comparator: comparator), withInputs: [lhs, rhs])
         body()
         perform(EndWhile())
     }
     
-    public func doWhileLoop(_ lhs: Variable, _ comparator: Comparator, _ rhs: Variable, _ body: () -> ()) {
+    public func doWhileLoop(_ lhs: Variable, _ comparator: Comparator, _ rhs: Variable, _ body: () -> Void) {
         perform(BeginDoWhile())
         body()
         perform(EndDoWhile(comparator: comparator), withInputs: [lhs, rhs])
@@ -533,7 +533,7 @@ public class ProgramBuilder {
         perform(Continue(), withInputs: [])
     }
     
-    public func beginTry(_ body: () -> ()) {
+    public func beginTry(_ body: () -> Void) {
         perform(BeginTry())
         body()
     }

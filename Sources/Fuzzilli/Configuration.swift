@@ -48,7 +48,7 @@ public struct Configuration {
     /// Dropout can provide a way to make multiple instances less "similar" to each
     /// other as it forces them to (re)discover edges in a different way.
     public let dropoutRate: Double
-    
+
     public init(timeout: UInt32 = 250,
                 skipStartupTests: Bool = false,
                 speedTestMode: Bool = false,

@@ -56,6 +56,12 @@ fileprivate class MockEvaluator: ProgramEvaluator {
     var isInitialized: Bool {
         return true
     }
+    
+    func exportState() -> Data {
+        return Data()
+    }
+    
+    func importState(_ state: Data) {}
 }
 
 /// Create a fuzzer instance usable for testing.
@@ -87,15 +93,13 @@ func makeMockFuzzer() -> Fuzzer {
     let lifter = JavaScriptLifter(prefix: "", suffix: "", inliningPolicy: InlineOnlyLiterals())
     
     // Corpus managing interesting programs that have been found during fuzzing.
-    let corpus = Corpus(minSize: 1000, minMutationsPerSample: 5)
+    let corpus = Corpus(minSize: 1000, maxSize: 2000, minMutationsPerSample: 5)
     
     // Minimizer to minimize crashes and interesting programs.
     let minimizer = Minimizer()
     
     // Construct the fuzzer instance.
-    let fuzzer = Fuzzer(id: 0,
-                        queue: DispatchQueue.main,
-                        configuration: configuration,
+    let fuzzer = Fuzzer(configuration: configuration,
                         scriptRunner: runner,
                         coreFuzzer: core,
                         codeGenerators: testCodeGenerators,
@@ -103,7 +107,8 @@ func makeMockFuzzer() -> Fuzzer {
                         environment: environment,
                         lifter: lifter,
                         corpus: corpus,
-                        minimizer: minimizer)
+                        minimizer: minimizer,
+                        queue: OperationQueue.main)
     
     fuzzer.initialize()
     return fuzzer
